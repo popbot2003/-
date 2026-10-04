@@ -1,0 +1,35 @@
+{
+  "name": "black-chat",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "cap": "capacitor",
+    "cap:add": "capacitor add android",
+    "cap:build": "npm run build && capacitor copy android",
+    "cap:run": "capacitor run android",
+    "cap:sync": "npm run build && capacitor sync android",
+    "android:build": "cd android && ./gradlew assembleRelease",
+    "android:buildDebug": "cd android && ./gradlew assembleDebug",
+    "android:open": "cd android && ./gradlew openAndroidStudio"
+  },
+  "dependencies": {
+    "@capacitor/app": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/splash-screen": "^6.0.0",
+    "@capacitor/status-bar": "^6.0.0",
+    "@supabase/supabase-js": "^2.49.4",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0",
+    "@types/node": "^20.10.0",
+    "@vitejs/plugin-react": "^4.2.1",
+    "typescript": "^5.3.3",
+    "vite": "^4.5.14"
+  }
+}
