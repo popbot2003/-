@@ -1,0 +1,79 @@
+name: Build Black Chat APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find ZIP file
+        run: |
+          ZIP_FILE=$(find . -maxdepth 1 -type f -name "*.zip" | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP file found"
+            exit 1
+          fi
+          echo "ZIP_FILE=$ZIP_FILE" >> $GITHUB_ENV
+
+      - name: Extract project
+        run: |
+          mkdir extracted
+          unzip -q "$ZIP_FILE" -d extracted
+
+      - name: Locate project
+        run: |
+          PROJECT=$(find extracted -name package.json -type f | head -n 1 | xargs dirname)
+          if [ -z "$PROJECT" ]; then
+            echo "package.json not found"
+            exit 1
+          fi
+          echo "PROJECT=$PROJECT" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT }}
+        run: npm install
+
+      - name: Build web project
+        working-directory: ${{ env.PROJECT }}
+        run: npm run build
+
+      - name: Install Capacitor Android
+        working-directory: ${{ env.PROJECT }}
+        run: npm install @capacitor/android
+
+      - name: Add Android
+        working-directory: ${{ env.PROJECT }}
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        working-directory: ${{ env.PROJECT }}
+        run: npx cap sync android
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT }}/android
+        run: chmod +x gradlew && ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: black-chat-apk
+          path: ${{ env.PROJECT }}/android/app/build/outputs/apk/debug/app-debug.apk
