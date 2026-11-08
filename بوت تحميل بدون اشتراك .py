@@ -3,7 +3,6 @@ import re
 import json
 import time
 import shutil
-import subprocess
 import tempfile
 import asyncio
 from pathlib import Path
@@ -29,11 +28,9 @@ PLACEHOLDER = "ضع_توكن_البوت_هنا"
 MAX_CONCURRENT_DOWNLOADS = 3
 CACHE_TTL = 300
 
-# حد تيليجرام للبوتات = 50MB، نترك هامش أمان
 MAX_FILE_SIZE_MB = 45
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 
-# الجودات المفضلة بالترتيب (الأفضل → الأقل)
 PREFERRED_HEIGHTS = [720, 480, 360, 240, 144]
 
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -129,27 +126,15 @@ FACEBOOK_RE = re.compile(
 
 
 # =========================================================
-# FFMPEG - AUTO SETUP (silent fail on Pydroid)
+# FFMPEG CHECK (على الاستضافة يجب أن يكون مثبتاً)
 # =========================================================
 
 def _setup_ffmpeg():
     if shutil.which("ffmpeg"):
         print("✅ FFmpeg متوفر في PATH.")
         return True
-
-    try:
-        import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if exe and os.path.exists(exe):
-            os.environ["PATH"] = (
-                os.path.dirname(exe) + os.pathsep + os.environ.get("PATH", "")
-            )
-            print(f"✅ FFmpeg من imageio-ffmpeg: {exe}")
-            return True
-    except Exception:
-        pass
-
-    print("ℹ️ FFmpeg غير متوفر — سيعمل البوت بالصيغ الجاهزة فقط (480p/720p).")
+    print("⚠️ FFmpeg غير متوفر! سيتم تعطيل دمج الصوت/الفيديو.")
+    print("   على Ubuntu/Debian: sudo apt install -y ffmpeg")
     return False
 
 
@@ -174,6 +159,12 @@ BASE_OPTS = {
         )
     },
 }
+
+YOUTUBE_CLIENT_OPTS = [
+    {"youtube": {"player_client": ["android", "web"]}},
+    {"youtube": {"player_client": ["ios", "web"]}},
+    {"youtube": {"player_client": ["tv_embedded", "web"]}},
+]
 
 
 # =========================================================
@@ -251,22 +242,50 @@ async def safe_edit_message(query, text, reply_markup=None):
 
 
 # =========================================================
-# EXTRACT INFO
+# EXTRACT INFO (with YouTube fallbacks)
 # =========================================================
+
+def _extract_once(url, extra_args=None):
+    opts = dict(BASE_OPTS)
+    opts["skip_download"] = True
+    if extra_args:
+        opts["extractor_args"] = extra_args
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
 
 def extract_info(url):
     cached = format_cache.get(url)
     if cached and time.time() - cached["time"] < CACHE_TTL:
         return cached["data"]
 
-    opts = dict(BASE_OPTS)
-    opts["skip_download"] = True
+    info = None
+    last_error = None
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        info = _extract_once(url)
+    except Exception as e:
+        last_error = e
+        print("⚠️ default extract failed:", repr(e))
+
+        if YOUTUBE_RE.search(url):
+            for args in YOUTUBE_CLIENT_OPTS:
+                try:
+                    print("🔄 retry with extractor_args:", args)
+                    info = _extract_once(url, extra_args=args)
+                    if info:
+                        break
+                except Exception as e2:
+                    last_error = e2
+                    print("⚠️ retry failed:", repr(e2))
+
+    if not info:
+        raise last_error or Exception("extraction failed")
 
     formats = info.get("formats", [])
-    videos = {}
+    videos = {}        # صيغ مدمجة (فيديو + صوت)
+    videos_only = {}   # فيديو فقط
+    audios = []        # صوت فقط
 
     for fmt in formats:
         format_id = fmt.get("format_id")
@@ -276,16 +295,12 @@ def extract_info(url):
         vcodec = fmt.get("vcodec")
         acodec = fmt.get("acodec")
         height = int(fmt.get("height") or 0)
+        size = get_size(fmt)
 
-        # نريد فقط فيديو فيه صوت مدمج (بدون ffmpeg)
-        if (
-            vcodec
-            and vcodec != "none"
-            and acodec
-            and acodec != "none"
-            and height
-        ):
-            size = get_size(fmt)
+        has_v = vcodec and vcodec != "none"
+        has_a = acodec and acodec != "none"
+
+        if has_v and has_a and height:
             score = (int(fmt.get("tbr") or 0), size or 0)
             current = videos.get(height)
             if current is None or score > current["_score"]:
@@ -294,20 +309,41 @@ def extract_info(url):
                     "height": height,
                     "ext": fmt.get("ext") or "mp4",
                     "filesize": size,
+                    "combined": True,
                     "_score": score,
                 }
+        elif has_v and not has_a and height:
+            score = (int(fmt.get("tbr") or 0), size or 0)
+            current = videos_only.get(height)
+            if current is None or score > current["_score"]:
+                videos_only[height] = {
+                    "format_id": format_id,
+                    "height": height,
+                    "ext": fmt.get("ext") or "mp4",
+                    "filesize": size,
+                    "combined": False,
+                    "_score": score,
+                }
+        elif has_a and not has_v:
+            audios.append(fmt)
 
-    video_list = sorted(
-        videos.values(), key=lambda x: x["height"], reverse=True
-    )
+    video_list = sorted(videos.values(), key=lambda x: x["height"], reverse=True)
+    video_only_list = sorted(videos_only.values(), key=lambda x: x["height"], reverse=True)
+    best_audio = None
+    if audios:
+        best_audio = max(
+            audios,
+            key=lambda f: (int(f.get("abr") or 0), get_size(f) or 0),
+        )
 
     result = {
         "title": info.get("title") or "",
         "thumbnail": info.get("thumbnail"),
         "duration": info.get("duration"),
         "filesize": info.get("filesize") or info.get("filesize_approx"),
-        "video": video_list,
-        # fallback إذا ما فيه صيغ منفصلة
+        "video": video_list,             # مدمجة
+        "video_only": video_only_list,   # فيديو فقط (يحتاج دمج)
+        "best_audio": best_audio,
         "raw_info": info,
     }
 
@@ -320,65 +356,71 @@ def extract_info(url):
 # =========================================================
 
 def pick_best_video(info):
-    """
-    يختار أفضل جودة حسب القيود:
-    - الأفضل المفضّل: 720p
-    - إذا الحجم > 45MB → انزل تدريجياً
-    - إذا لا توجد صيغ → None
-    """
     videos = info.get("video", [])
-    if not videos:
-        return None
+    if videos:
+        by_height = {v["height"]: v for v in videos}
+        for h in PREFERRED_HEIGHTS:
+            fmt = by_height.get(h)
+            if not fmt:
+                continue
+            size = fmt.get("filesize")
+            if size is None or size <= MAX_FILE_SIZE:
+                return fmt
+        return min(videos, key=lambda v: v.get("filesize") or float("inf"))
 
-    # خريطة height → format
-    by_height = {v["height"]: v for v in videos}
+    # لا يوجد مدمج → استخدم فيديو فقط + صوت
+    if FFMPEG_AVAILABLE:
+        vo = info.get("video_only", [])
+        if vo:
+            by_height = {v["height"]: v for v in vo}
+            for h in PREFERRED_HEIGHTS:
+                fmt = by_height.get(h)
+                if fmt:
+                    return fmt
+            return vo[0]
 
-    # المحاولة بالترتيب المفضّل
-    for h in PREFERRED_HEIGHTS:
-        fmt = by_height.get(h)
-        if not fmt:
-            continue
-
-        size = fmt.get("filesize")
-        # إذا الحجم غير معروف، نأخذه كاحتمال أول
-        if size is None or size <= MAX_FILE_SIZE:
-            return fmt
-
-    # إذا كل الصيغ كبيرة، خذ الأصغر
-    smallest = min(
-        videos,
-        key=lambda v: v.get("filesize") or float("inf"),
-    )
-    return smallest
+    return None
 
 
 # =========================================================
-# BUILD CANDIDATES (fallback chain)
+# BUILD CANDIDATES
 # =========================================================
 
 def build_video_candidates(info, picked):
-    """
-    يبني سلسلة صيغ مرشحة بالترتيب:
-    - picked (الأفضل جودة/حجم)
-    - أقل جودة تلقائياً
-    - best العام
-    """
     candidates = []
     videos = sorted(info.get("video", []), key=lambda x: x["height"], reverse=True)
+    videos_only = sorted(info.get("video_only", []), key=lambda x: x["height"], reverse=True)
 
     if picked:
-        candidates.append(picked["format_id"])
+        if picked.get("combined"):
+            candidates.append(picked["format_id"])
+        else:
+            # فيديو فقط + صوت
+            audio_id = (info.get("best_audio") or {}).get("format_id")
+            if audio_id:
+                candidates.append(f"{picked['format_id']}+{audio_id}")
+            candidates.append(picked["format_id"])
 
-    # أضف باقي الصيغ بالترتيب من الأعلى للأقل
     for v in videos:
         if v["format_id"] not in candidates:
             candidates.append(v["format_id"])
 
-    # fallback نهائي
+    if FFMPEG_AVAILABLE:
+        audio_id = (info.get("best_audio") or {}).get("format_id")
+        for v in videos_only:
+            if audio_id:
+                sel = f"{v['format_id']}+{audio_id}"
+                if sel not in candidates:
+                    candidates.append(sel)
+            if v["format_id"] not in candidates:
+                candidates.append(v["format_id"])
+
+    # fallback chain أوسع
+    candidates.append("bv*+ba/b")
+    candidates.append("bestvideo+bestaudio/best")
     candidates.append("best[ext=mp4]/best")
     candidates.append("best")
 
-    # إزالة التكرارات
     seen = set()
     final = []
     for c in candidates:
@@ -448,6 +490,8 @@ async def download_video(url, info, picked):
                     )
 
                 files = [p for p in Path(temp_dir).glob("*") if p.is_file()]
+                # تجاهل ملفات .part
+                files = [p for p in files if not p.name.endswith(".part")]
                 if not files:
                     clean_temp_dir(temp_dir)
                     continue
@@ -513,6 +557,7 @@ async def download_audio(url, info):
                     )
 
                 files = [p for p in Path(temp_dir).glob("*") if p.is_file()]
+                files = [p for p in files if not p.name.endswith(".part")]
                 if not files:
                     clean_temp_dir(temp_dir)
                     continue
@@ -545,11 +590,12 @@ async def download_audio(url, info):
 async def send_preview(update, platform, url, info):
     duration = format_duration(info.get("duration"))
 
-    # اختر الجودة مسبقاً لعرض الحجم المتوقع
     picked = pick_best_video(info)
     if picked:
         size_text = format_size(picked.get("filesize"))
         quality_text = f"{picked['height']}p"
+        if not picked.get("combined") and not FFMPEG_AVAILABLE:
+            quality_text += " (بدون دمج)"
     else:
         size_text = "—"
         quality_text = "تلقائي"
@@ -619,7 +665,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("Extraction error:", repr(e))
         try:
-            await message.edit_text(f"❌ فشل التحليل: {type(e).__name__}")
+            await message.edit_text(
+                f"❌ فشل التحليل.\n"
+                f"السبب: {type(e).__name__}\n"
+                f"تأكد من تثبيت ffmpeg و nodejs على الاستضافة."
+            )
         except Exception:
             pass
 
@@ -643,7 +693,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(query, "❌ انتهت الجلسة، أعد إرسال الرابط")
         return
 
-    # ---------- VIDEO ----------
     if action == "mode_video":
         picked = pick_best_video(info)
         quality_hint = f"{picked['height']}p" if picked else "تلقائي"
@@ -662,6 +711,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             file_size = os.path.getsize(temp_file)
             print(f"📦 Final size: {format_size(file_size)}")
+
+            if file_size > MAX_FILE_SIZE:
+                await query.message.reply_text(
+                    f"⚠️ حجم الملف {format_size(file_size)} أكبر من حد تيليجرام "
+                    f"({MAX_FILE_SIZE_MB}MB). جرّب جودة أقل."
+                )
+                return
 
             caption_parts = []
             if title:
@@ -694,7 +750,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         return
 
-    # ---------- AUDIO ----------
     if action == "mode_audio":
         await safe_edit_message(query, "⏳ جاري تحميل الصوت...")
 
