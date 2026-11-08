@@ -126,7 +126,7 @@ FACEBOOK_RE = re.compile(
 
 
 # =========================================================
-# FFMPEG CHECK (على الاستضافة يجب أن يكون مثبتاً)
+# FFMPEG CHECK
 # =========================================================
 
 def _setup_ffmpeg():
@@ -139,6 +139,17 @@ def _setup_ffmpeg():
 
 
 FFMPEG_AVAILABLE = _setup_ffmpeg()
+
+
+# =========================================================
+# PROXY
+# =========================================================
+
+PROXY = os.getenv("YTDL_PROXY", "").strip()
+if PROXY:
+    print(f"🌐 سيتم استخدام الوكيل: {PROXY.split('@')[-1]}")
+else:
+    print("ℹ️ لا يوجد وكيل مُعرّف (YTDL_PROXY). قد تفشل بعض فيديوهات يوتيوب الجغرافية.")
 
 
 # =========================================================
@@ -159,6 +170,9 @@ BASE_OPTS = {
         )
     },
 }
+
+if PROXY:
+    BASE_OPTS["proxy"] = PROXY
 
 YOUTUBE_CLIENT_OPTS = [
     {"youtube": {"player_client": ["android", "web"]}},
@@ -283,9 +297,9 @@ def extract_info(url):
         raise last_error or Exception("extraction failed")
 
     formats = info.get("formats", [])
-    videos = {}        # صيغ مدمجة (فيديو + صوت)
-    videos_only = {}   # فيديو فقط
-    audios = []        # صوت فقط
+    videos = {}
+    videos_only = {}
+    audios = []
 
     for fmt in formats:
         format_id = fmt.get("format_id")
@@ -341,8 +355,8 @@ def extract_info(url):
         "thumbnail": info.get("thumbnail"),
         "duration": info.get("duration"),
         "filesize": info.get("filesize") or info.get("filesize_approx"),
-        "video": video_list,             # مدمجة
-        "video_only": video_only_list,   # فيديو فقط (يحتاج دمج)
+        "video": video_list,
+        "video_only": video_only_list,
         "best_audio": best_audio,
         "raw_info": info,
     }
@@ -368,7 +382,6 @@ def pick_best_video(info):
                 return fmt
         return min(videos, key=lambda v: v.get("filesize") or float("inf"))
 
-    # لا يوجد مدمج → استخدم فيديو فقط + صوت
     if FFMPEG_AVAILABLE:
         vo = info.get("video_only", [])
         if vo:
@@ -395,7 +408,6 @@ def build_video_candidates(info, picked):
         if picked.get("combined"):
             candidates.append(picked["format_id"])
         else:
-            # فيديو فقط + صوت
             audio_id = (info.get("best_audio") or {}).get("format_id")
             if audio_id:
                 candidates.append(f"{picked['format_id']}+{audio_id}")
@@ -415,7 +427,6 @@ def build_video_candidates(info, picked):
             if v["format_id"] not in candidates:
                 candidates.append(v["format_id"])
 
-    # fallback chain أوسع
     candidates.append("bv*+ba/b")
     candidates.append("bestvideo+bestaudio/best")
     candidates.append("best[ext=mp4]/best")
@@ -490,7 +501,6 @@ async def download_video(url, info, picked):
                     )
 
                 files = [p for p in Path(temp_dir).glob("*") if p.is_file()]
-                # تجاهل ملفات .part
                 files = [p for p in files if not p.name.endswith(".part")]
                 if not files:
                     clean_temp_dir(temp_dir)
@@ -665,11 +675,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("Extraction error:", repr(e))
         try:
-            await message.edit_text(
-                f"❌ فشل التحليل.\n"
-                f"السبب: {type(e).__name__}\n"
-                f"تأكد من تثبيت ffmpeg و nodejs على الاستضافة."
-            )
+            err_str = str(e)
+            if "not made this video available in your country" in err_str:
+                msg = (
+                    "❌ هذا الفيديو مقيّد جغرافياً ولا يمكن تحميله من موقع الخادم الحالي.\n"
+                    "💡 الحل: إضافة وكيل (Proxy) من دولة مسموح لها عبر متغير البيئة YTDL_PROXY."
+                )
+            elif "Sign in to confirm" in err_str:
+                msg = (
+                    "❌ يوتيوب يطلب تسجيل الدخول للتحقق.\n"
+                    "💡 جرّب إضافة وكيل عبر YTDL_PROXY أو استخدم كوكيز."
+                )
+            else:
+                msg = f"❌ فشل التحليل.\nالسبب: {type(e).__name__}"
+            await message.edit_text(msg)
         except Exception:
             pass
 
